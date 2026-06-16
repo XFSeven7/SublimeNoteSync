@@ -115,6 +115,10 @@ def ensure_git_remote():
     else:
         git("remote", "add", "origin", remote)
 
+def _has_remote():
+    c, out, _ = git("remote")
+    return c == 0 and bool(out.strip())
+
 def full_git_sync(status_callback=None, log_path=None):
     def report(msg):
         if status_callback:
@@ -123,18 +127,30 @@ def full_git_sync(status_callback=None, log_path=None):
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(msg + "\n")
 
-    report("Syncing… pull")
-    code, out, err = git("pull", "--rebase", "--autostash")
-    if code != 0:
-        msg = "Pull failed: {}".format(err or out)
-        report(msg)
-        _log(msg)
-        return False, msg
+    if _has_remote():
+        report("Syncing… pull")
+        code, out, err = git("pull", "--rebase", "--autostash")
+        if code != 0:
+            _log("Pull failed: {}".format(err or out))
+            report("Pull failed, continuing…")
+    else:
+        _log("No remote configured, skip pull")
 
     c, out, _ = git("status", "--porcelain")
     if c == 0 and out.strip():
         git("add", "-A")
-        git("commit", "-m", "{}: {}".format(COMMIT_PREFIX, now_str()))
+        cc, _, cerr = git("commit", "-m", "{}: {}".format(COMMIT_PREFIX, now_str()))
+        if cc != 0:
+            msg = "Commit failed: {}".format(cerr)
+            report(msg)
+            return False, msg
+    else:
+        report("No changes")
+        return True, "No changes"
+
+    if not _has_remote():
+        report("Committed locally ✔")
+        return True, "Committed locally"
 
     pc, pout, perr = git("push")
     if pc == 0:
