@@ -6,6 +6,7 @@ import datetime
 import threading
 import subprocess
 import shlex
+import tempfile
 
 # =============== 基础与工具 ===============
 CONFIG_FILE = os.path.expanduser("~/.sublime_note_sync.json")
@@ -13,14 +14,23 @@ CONFIG_FILE = os.path.expanduser("~/.sublime_note_sync.json")
 def _expand(p):
     return os.path.normpath(os.path.expanduser(os.path.expandvars(p or "")))
 
+def _popen_kwargs():
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return kw
+
 def _run(cmd, cwd=None):
     try:
+        popen_kw = _popen_kwargs()
+        if cwd:
+            popen_kw["cwd"] = cwd
         p = subprocess.Popen(
             cmd if isinstance(cmd, list) else shlex.split(cmd),
-            cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            universal_newlines=True
+            universal_newlines=True,
+            **popen_kw
         )
         out, err = p.communicate()
         return p.returncode, (out or "").strip(), (err or "").strip()
@@ -30,6 +40,10 @@ def _run(cmd, cwd=None):
 def _status(msg):
     sublime.status_message("[NotesSync] " + msg)
     print("[NotesSync]", msg)
+
+def _log(msg):
+    if CFG.get("log_level") == "debug":
+        print("[NotesSync:debug]", msg)
 
 def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -68,36 +82,68 @@ GIT_DEBOUNCE_MS = int(CFG.get("git_debounce_ms", 5000))
 COMMIT_PREFIX = CFG.get("commit_prefix", "auto")
 
 # =============== Git 包装 ===============
-def git(args):
-    return _run("git " + args, cwd=BASE_DIR)
+def git(*args):
+    return _run(["git", "-C", BASE_DIR] + list(args))
 
 def ensure_dir(path):
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
 
 def is_git_repo():
-    code, out, _ = _run("git rev-parse --is-inside-work-tree", cwd=BASE_DIR)
+    code, out, _ = _run(["git", "rev-parse", "--is-inside-work-tree"], cwd=BASE_DIR)
     return code == 0 and out == "true"
 
 def git_set_local_identity():
     name = (CFG.get("git_user") or {}).get("user.name") or ""
     email = (CFG.get("git_user") or {}).get("user.email") or ""
     if name:
-        _run('git config user.name "{}"'.format(name), cwd=BASE_DIR)
+        git("config", "user.name", name)
     if email:
-        _run('git config user.email "{}"'.format(email), cwd=BASE_DIR)
+        git("config", "user.email", email)
     if name or email:
         _status("Git identity set: {} {}".format(name or "?", email or "?"))
 
 def ensure_git_remote():
-    remote = CFG.get("git_remote") or ""
+    remote = (CFG.get("git_remote") or "").strip()
     if not remote:
         return
-    c, out, _ = git("remote -v")
-    if c == 0 and remote in out:
+    c, out, _ = git("remote", "get-url", "origin")
+    if c == 0 and out.strip() == remote:
         return
-    git("remote remove origin")
-    git("remote add origin {}".format(remote))
+    if c == 0:
+        git("remote", "set-url", "origin", remote)
+    else:
+        git("remote", "add", "origin", remote)
+
+def full_git_sync(status_callback=None, log_path=None):
+    def report(msg):
+        if status_callback:
+            status_callback(msg)
+        if log_path:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+
+    report("Syncing… pull")
+    code, out, err = git("pull", "--rebase", "--autostash")
+    if code != 0:
+        msg = "Pull failed: {}".format(err or out)
+        report(msg)
+        _log(msg)
+        return False, msg
+
+    c, out, _ = git("status", "--porcelain")
+    if c == 0 and out.strip():
+        git("add", "-A")
+        git("commit", "-m", "{}: {}".format(COMMIT_PREFIX, now_str()))
+
+    pc, pout, perr = git("push")
+    if pc == 0:
+        report("Synced ✔")
+        return True, "Synced"
+    msg = "Push failed: {}".format(perr or pout)
+    report(msg)
+    _log(msg)
+    return False, msg
 
 # =============== 后台异步 Push（退出秒退） ===============
 def spawn_async_push():
@@ -107,43 +153,45 @@ def spawn_async_push():
     """
     log_path = os.path.join(BASE_DIR, ".notesync_push.log")
     stamp = now_str()
+    commit_msg = "{}: {}".format(COMMIT_PREFIX, stamp)
 
     if os.name == "nt":
-        # Windows
-        cmd = (
-            'cmd.exe /c '
-            f'cd /d "{BASE_DIR}" && '
-            'git pull --rebase --autostash && '
-            f'(git add -A && git commit -m "{COMMIT_PREFIX}: {stamp}" || exit /b 0) && '
-            'git push '
-            f'> "{log_path}" 2>&1'
-        )
-        DETACHED_PROCESS = 0x00000008
         try:
-            subprocess.Popen(
-                cmd,
-                shell=True,
-                creationflags=DETACHED_PROCESS
-            )
+            fd, bat_path = tempfile.mkstemp(suffix=".cmd", prefix="notesync_")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("@echo off\n")
+                f.write('git -C "{}" pull --rebase --autostash >> "{}" 2>&1\n'.format(BASE_DIR, log_path))
+                f.write('git -C "{}" add -A >> "{}" 2>&1\n'.format(BASE_DIR, log_path))
+                f.write('git -C "{}" commit -m "{}" >> "{}" 2>&1\n'.format(
+                    BASE_DIR, commit_msg.replace('"', '""'), log_path))
+                f.write("if errorlevel 1 ver >nul\n")
+                f.write('git -C "{}" push >> "{}" 2>&1\n'.format(BASE_DIR, log_path))
+                f.write('del /f /q "{}"\n'.format(bat_path))
+
+            kw = _popen_kwargs()
+            kw["creationflags"] = kw.get("creationflags", 0) | 0x00000008  # DETACHED_PROCESS
+            subprocess.Popen([bat_path], **kw)
         except Exception as e:
-            _status(f"Async push spawn failed: {e}")
+            _status("Async push spawn failed: {}".format(e))
     else:
-        # macOS / Linux
         bash_cmd = (
-            f'cd {shlex.quote(BASE_DIR)} && '
-            'git pull --rebase --autostash && '
-            f'(git add -A && git commit -m {shlex.quote(COMMIT_PREFIX + ": " + stamp)} || true) && '
-            f'git push >> {shlex.quote(log_path)} 2>&1'
+            "git -C {repo} pull --rebase --autostash && "
+            "git -C {repo} add -A && "
+            "(git -C {repo} commit -m {msg} || true) && "
+            "git -C {repo} push"
+        ).format(
+            repo=shlex.quote(BASE_DIR),
+            msg=shlex.quote(commit_msg),
         )
         try:
-            subprocess.Popen(
-                ["bash", "-lc", bash_cmd],
-                start_new_session=True,   # 脱离 Sublime 进程
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+            with open(log_path, "a", encoding="utf-8") as log_f:
+                kw = _popen_kwargs()
+                kw["start_new_session"] = True
+                kw["stdout"] = log_f
+                kw["stderr"] = subprocess.STDOUT
+                subprocess.Popen(["bash", "-lc", bash_cmd], **kw)
         except Exception as e:
-            _status(f"Async push spawn failed: {e}")
+            _status("Async push spawn failed: {}".format(e))
 
 # =============== 同步器（自动防抖） ===============
 class GitSyncManager:
@@ -163,7 +211,6 @@ class GitSyncManager:
         return cls._instance
 
     def poke(self):
-        # 防抖触发
         if self._timer:
             try:
                 self._timer.cancel()
@@ -182,19 +229,7 @@ class GitSyncManager:
 
     def _sync(self):
         try:
-            _status("Syncing… pull")
-            git("pull --rebase --autostash")
-
-            c, out, _ = git("status --porcelain")
-            if c == 0 and out.strip():
-                git("add -A")
-                git('commit -m "{}: {}"'.format(COMMIT_PREFIX, now_str()))
-
-            pc, pout, perr = git("push")
-            if pc == 0:
-                _status("Synced ✔")
-            else:
-                _status("Push failed: {}".format(perr or pout))
+            full_git_sync(status_callback=_status)
         finally:
             self._busy = False
             if self._pending:
@@ -210,9 +245,14 @@ class GitSyncManager:
 
 # =============== 业务逻辑：新建/自动保存/清理 ===============
 def in_repo(path):
+    if not path:
+        return False
     try:
-        return os.path.abspath(path or "").startswith(os.path.abspath(BASE_DIR) + os.sep)
-    except Exception:
+        return os.path.commonpath([
+            os.path.abspath(path),
+            os.path.abspath(BASE_DIR),
+        ]) == os.path.abspath(BASE_DIR)
+    except ValueError:
         return False
 
 def month_dir():
@@ -283,7 +323,6 @@ class NotesSafeExitCommand(sublime_plugin.ApplicationCommand):
     """
     def run(self):
         try:
-            # 1) 保存所有未保存视图
             for w in sublime.windows():
                 for v in w.views():
                     try:
@@ -292,18 +331,13 @@ class NotesSafeExitCommand(sublime_plugin.ApplicationCommand):
                     except Exception:
                         pass
 
-            # 2) 停掉自动防抖，避免退出后又触发
             GitSyncManager.get().cancel_timer()
-
-            # 3) 异步后台 push（独立进程）
             spawn_async_push()
         finally:
-            # 4) 立即退出
             sublime.run_command("exit")
 
 # =============== 启动初始化 ===============
 def plugin_loaded():
-    # 目录
     if not BASE_DIR:
         sublime.error_message("NotesSync: repo_path missing.\nEdit: {}".format(CONFIG_FILE))
         return
@@ -314,16 +348,15 @@ def plugin_loaded():
             sublime.error_message("NotesSync: repo_path not found.\n{}".format(BASE_DIR))
             return
 
-    # Git 初始化 & 拉取
     def init():
         if not is_git_repo():
             _status("Init git repo…")
-            _run("git init", cwd=BASE_DIR)
+            _run(["git", "init"], cwd=BASE_DIR)
 
         git_set_local_identity()
         ensure_git_remote()
 
         _status("Initializing pull…")
-        git("pull --rebase --autostash")
+        git("pull", "--rebase", "--autostash")
         _status("Ready")
     threading.Thread(target=init, daemon=True).start()
