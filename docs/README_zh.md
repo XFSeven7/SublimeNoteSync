@@ -25,15 +25,18 @@
 ## 笔记目录结构
 
 ```
-~/Documents/SublimeNotes/YYYY-MM/note_YYYY-MM-DD_HH-MM-SS.txt
+~/Documents/SublimeNotes/-notes/YYYY-MM/note_YYYY-MM-DD_HH-MM-SS.txt
 ```
+
+`-notes` 会排在侧边栏最上面。启动时会把仓库根目录下遗留的 `YYYY-MM` 文件夹自动迁入其中。
 
 示例：
 
 ```
-2025-02/
-  note_2025-02-18_21-44-11.txt
-  note_2025-02-19_10-02-55.txt
+-notes/
+  2025-02/
+    note_2025-02-18_21-44-11.txt
+    note_2025-02-19_10-02-55.txt
 ```
 
 ---

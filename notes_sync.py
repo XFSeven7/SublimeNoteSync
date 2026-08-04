@@ -1,6 +1,7 @@
 import sublime
 import sublime_plugin
 import os
+import re
 import json
 import datetime
 import threading
@@ -77,6 +78,9 @@ def load_config():
 
 CFG = load_config()
 BASE_DIR = _expand(CFG.get("repo_path") or "~/Documents/SublimeNotes")
+# ponytail: leading '-' sorts above YYYY-MM / letter folders in Sublime sidebar
+NOTES_SUBDIR = "-notes"
+_MONTH_DIR_RE = re.compile(r"^\d{4}-\d{2}$")
 AUTO_SAVE_DELAY_MS = int(CFG.get("auto_save_delay_ms", 800))
 GIT_DEBOUNCE_MS = int(CFG.get("git_debounce_ms", 5000))
 COMMIT_PREFIX = CFG.get("commit_prefix", "auto")
@@ -271,17 +275,58 @@ def in_repo(path):
     except ValueError:
         return False
 
-def month_dir():
-    d = os.path.join(BASE_DIR, datetime.datetime.now().strftime("%Y-%m"))
+def notes_root():
+    d = os.path.join(BASE_DIR, NOTES_SUBDIR)
     ensure_dir(d)
     return d
+
+def month_dir():
+    d = os.path.join(notes_root(), datetime.datetime.now().strftime("%Y-%m"))
+    ensure_dir(d)
+    return d
+
+def note_target_dir(window):
+    """Same folder as active file if it's in the notes repo; else -notes/YYYY-MM."""
+    view = window.active_view() if window else None
+    if view:
+        fp = view.file_name()
+        if fp and in_repo(fp):
+            d = os.path.dirname(os.path.abspath(fp))
+            if os.path.isdir(d):
+                return d
+    return month_dir()
+
+def migrate_legacy_month_dirs():
+    """Move BASE_DIR/YYYY-MM → BASE_DIR/-notes/YYYY-MM (idempotent)."""
+    if not os.path.isdir(BASE_DIR):
+        return
+    dest_root = notes_root()
+    moved = 0
+    for name in os.listdir(BASE_DIR):
+        if name == NOTES_SUBDIR or not _MONTH_DIR_RE.match(name):
+            continue
+        src = os.path.join(BASE_DIR, name)
+        if not os.path.isdir(src):
+            continue
+        dst = os.path.join(dest_root, name)
+        if os.path.exists(dst):
+            _status("Skip migrate {} (already under {})".format(name, NOTES_SUBDIR))
+            continue
+        try:
+            os.rename(src, dst)
+            moved += 1
+        except Exception as e:
+            _status("Migrate {} failed: {}".format(name, e))
+    if moved:
+        _status("Migrated {} month folder(s) → {}".format(moved, NOTES_SUBDIR))
 
 class NewNoteCommand(sublime_plugin.WindowCommand):
     def run(self):
         if not os.path.isdir(BASE_DIR):
             sublime.error_message("NotesSync: repo_path invalid.\nEdit: {}".format(CONFIG_FILE))
             return
-        d = month_dir()
+        migrate_legacy_month_dirs()
+        d = note_target_dir(self.window)
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         fp = os.path.join(d, "note_{}.txt".format(ts))
         with open(fp, "w", encoding="utf-8"):
@@ -363,6 +408,8 @@ def plugin_loaded():
         else:
             sublime.error_message("NotesSync: repo_path not found.\n{}".format(BASE_DIR))
             return
+
+    migrate_legacy_month_dirs()
 
     def init():
         if not is_git_repo():

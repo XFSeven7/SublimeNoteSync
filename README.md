@@ -25,15 +25,18 @@ No UI. No popup. No commands needed once installed.
 ## Directory structure
 
 ```
-~/Documents/SublimeNotes/YYYY-MM/note_YYYY-MM-DD_HH-MM-SS.txt
+~/Documents/SublimeNotes/-notes/YYYY-MM/note_YYYY-MM-DD_HH-MM-SS.txt
 ```
+
+`-notes` sorts to the top of the sidebar. On load, any legacy top-level `YYYY-MM` folders are moved under it.
 
 Example:
 
 ```
-2025-02/
-  note_2025-02-18_21-44-11.txt
-  note_2025-02-19_10-02-55.txt
+-notes/
+  2025-02/
+    note_2025-02-18_21-44-11.txt
+    note_2025-02-19_10-02-55.txt
 ```
 
 ---
